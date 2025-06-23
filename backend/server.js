@@ -27,6 +27,39 @@ const pool = mysql.createPool({
   queueLimit: 0
 });
 
+// Add database connection to request object for mobile endpoints
+app.use((req, res, next) => {
+  req.db = pool;
+  next();
+});
+
+// Mobile-specific middleware
+app.use('/api/mobile', (req, res, next) => {
+  // Add mobile-specific headers
+  res.header('X-Mobile-API', 'v1.0');
+  res.header('X-Content-Type-Options', 'nosniff');
+  res.header('X-Frame-Options', 'DENY');
+  next();
+});
+
+// Enhanced error responses for mobile
+const mobileErrorHandler = (error, req, res, next) => {
+  const isMobile = req.headers['user-agent']?.includes('Mobile') || req.path.includes('/mobile/');
+  
+  if (isMobile) {
+    console.error('Mobile API Error:', error);
+    res.status(error.status || 500).json({
+      success: false,
+      message: error.message || 'Internal server error',
+      code: error.code || 'UNKNOWN_ERROR',
+      timestamp: new Date().toISOString()
+    });
+  } else {
+    // Existing web error handling
+    next(error);
+  }
+};
+
 // Constants
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 const VIDEO_TOKEN_EXPIRY = '1m'; // 1 minute
@@ -34,7 +67,7 @@ const OTP_EXPIRY = 10 * 60 * 1000; // 10 minutes in milliseconds
 const REGISTRATION_OTP_EXPIRY = 10 * 60 * 1000; // 10 minutes in milliseconds
 
 // Email transporter setup
-const transporter = nodemailer.createTransport({
+const transporter = nodemailer.createTransporter({
   host: process.env.EMAIL_HOST,
   port: process.env.EMAIL_PORT,
   secure: process.env.EMAIL_SECURE === 'true',
@@ -49,6 +82,136 @@ const otpStore = new Map(); // email -> { otp, expiry }
 // Store registration OTPs in memory (in production, use Redis or another persistent store)
 const registrationOtpStore = new Map(); // email -> { otp, expiry, userData }
 
+// Import mobile endpoints
+const mobileRoutes = require('./mobile-endpoints');
+app.use('/api/mobile', mobileRoutes);
+
+// Mobile-optimized endpoints
+app.get('/api/mobile/courses', async (req, res) => {
+  try {
+    const connection = await pool.getConnection();
+    const [courses] = await connection.execute(`
+      SELECT 
+        id, title, description, thumbnail, mobileOptimized, downloadable, estimatedSize,
+        (SELECT COUNT(*) FROM course_modules WHERE courseId = courses.id) as moduleCount
+      FROM courses 
+      WHERE mobileOptimized = TRUE
+      ORDER BY created_at DESC
+    `);
+    connection.release();
+    
+    res.json({
+      success: true,
+      data: courses
+    });
+  } catch (error) {
+    console.error('Error fetching mobile courses:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch courses',
+      code: 'COURSES_ERROR'
+    });
+  }
+});
+
+app.get('/api/mobile/course/:courseId/modules', async (req, res) => {
+  try {
+    const { courseId } = req.params;
+    const connection = await pool.getConnection();
+    
+    const [modules] = await connection.execute(`
+      SELECT 
+        cm.*,
+        COALESCE(vp.watchedPercentage, 0) as progress,
+        vp.completed,
+        vp.lastWatchedPosition
+      FROM course_modules cm
+      LEFT JOIN video_progress vp ON cm.id = vp.moduleId AND vp.userId = ?
+      WHERE cm.courseId = ?
+      ORDER BY cm.day ASC
+    `, [req.query.userId || 0, courseId]);
+    
+    connection.release();
+    
+    res.json({
+      success: true,
+      data: modules
+    });
+  } catch (error) {
+    console.error('Error fetching course modules:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch course modules',
+      code: 'MODULES_ERROR'
+    });
+  }
+});
+
+// Batch API endpoint for mobile optimization
+app.post('/api/mobile/batch', async (req, res) => {
+  try {
+    const { requests } = req.body;
+    
+    if (!Array.isArray(requests)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Requests must be an array',
+        code: 'INVALID_BATCH_REQUEST'
+      });
+    }
+
+    const results = [];
+    
+    for (const request of requests) {
+      try {
+        // Process each request based on its type
+        let result;
+        switch (request.type) {
+          case 'course_progress':
+            const [progress] = await pool.execute(
+              'SELECT * FROM video_progress WHERE userId = ? AND courseId = ?',
+              [request.userId, request.courseId]
+            );
+            result = { success: true, data: progress };
+            break;
+            
+          case 'user_courses':
+            const [userCourses] = await pool.execute(
+              'SELECT c.* FROM courses c JOIN user_courses uc ON c.id = uc.courseId WHERE uc.userId = ?',
+              [request.userId]
+            );
+            result = { success: true, data: userCourses };
+            break;
+            
+          default:
+            result = { success: false, error: 'Unknown request type' };
+        }
+        
+        results.push({ id: request.id, ...result });
+      } catch (error) {
+        results.push({ 
+          id: request.id, 
+          success: false, 
+          error: error.message 
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      data: results
+    });
+
+  } catch (error) {
+    console.error('Batch request error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Batch request failed',
+      code: 'BATCH_ERROR'
+    });
+  }
+});
+
 // Test database connection
 app.get('/api/test-db', async (req, res) => {
   try {
@@ -60,31 +223,6 @@ app.get('/api/test-db', async (req, res) => {
     res.status(500).json({ message: 'Failed to connect to database', error: error.message });
   }
 });
-
-// Add to server.js - Mobile-specific enhancements
-app.use('/api/mobile', (req, res, next) => {
-  // Add mobile-specific headers
-  res.header('X-Mobile-API', 'v1.0');
-  next();
-});
-
-// Enhanced error responses for mobile
-const mobileErrorHandler = (error, req, res, next) => {
-  const isMobile = req.headers['user-agent']?.includes('Mobile');
-  
-  if (isMobile) {
-    res.status(error.status || 500).json({
-      success: false,
-      message: error.message,
-      code: error.code || 'UNKNOWN_ERROR',
-      timestamp: new Date().toISOString()
-    });
-  } else {
-    // Existing web error handling
-    next(error);
-  }
-};
-
 
 // Modified registration endpoint with OTP verification
 app.post('/api/register', async (req, res) => {
@@ -1294,8 +1432,12 @@ app.post('/api/reset-password', async (req, res) => {
   }
 });
 
+// Apply mobile error handler
+app.use(mobileErrorHandler);
+
 // Start server
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`Mobile API available at: http://localhost:${PORT}/api/mobile`);
 });
