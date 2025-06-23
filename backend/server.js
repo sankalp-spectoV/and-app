@@ -61,6 +61,31 @@ app.get('/api/test-db', async (req, res) => {
   }
 });
 
+// Add to server.js - Mobile-specific enhancements
+app.use('/api/mobile', (req, res, next) => {
+  // Add mobile-specific headers
+  res.header('X-Mobile-API', 'v1.0');
+  next();
+});
+
+// Enhanced error responses for mobile
+const mobileErrorHandler = (error, req, res, next) => {
+  const isMobile = req.headers['user-agent']?.includes('Mobile');
+  
+  if (isMobile) {
+    res.status(error.status || 500).json({
+      success: false,
+      message: error.message,
+      code: error.code || 'UNKNOWN_ERROR',
+      timestamp: new Date().toISOString()
+    });
+  } else {
+    // Existing web error handling
+    next(error);
+  }
+};
+
+
 // Modified registration endpoint with OTP verification
 app.post('/api/register', async (req, res) => {
   try {
