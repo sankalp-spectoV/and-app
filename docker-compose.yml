@@ -1,0 +1,72 @@
+version: '3.8'
+
+services:
+  # Backend API
+  backend:
+    build: ./backend
+    ports:
+      - "5000:5000"
+    environment:
+      - NODE_ENV=production
+      - DB_HOST=mysql
+      - DB_USER=root
+      - DB_PASSWORD=rootpassword
+      - DB_NAME=student_db
+    depends_on:
+      - mysql
+      - redis
+    volumes:
+      - ./backend/logs:/app/logs
+      - ./backend/uploads:/app/uploads
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  # MySQL Database
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: student_db
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./backend/mobile-schema.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  # Redis for caching and sessions
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./ssl:/etc/nginx/ssl
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - app-network
+
+volumes:
+  mysql_data:
+  redis_data:
+
+networks:
+  app-network:
+    driver: bridge
